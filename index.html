@@ -152,10 +152,14 @@
             <label for="zipDatabaseInput">ZIP Code Database (CSV):</label>
             <input type="file" id="zipDatabaseInput" accept=".csv">
         </div>
+        <div>
+            <label for="containedZipsInput">Contained ZIPs (JSON):</label>
+            <input type="file" id="containedZipsInput" accept=".json">
+        </div>
         <button id="visualizeButton">Visualize Polygons</button>
 
         <div id="searchContainer" style="display: none;">
-            <input type="text" id="locationSearch" placeholder="Search for business location...">
+            <input type="text" id="locationSearch" placeholder="Search for business ID or ZIP...">
             <div id="searchResults"></div>
         </div>
 
@@ -182,6 +186,7 @@
         // Variable to store the loaded data
         let zipCoordinates = {};
         let polygonData = [];
+        let containedZipsData = {};
         let processedPolygons = [];
         let markers = {
             vertices: [],
@@ -221,9 +226,10 @@
         function startVisualization() {
             const polygonFile = document.getElementById('polygonFileInput').files[0];
             const zipDbFile = document.getElementById('zipDatabaseInput').files[0];
+            const containedZipsFile = document.getElementById('containedZipsInput').files[0];
 
             if (!polygonFile || !zipDbFile) {
-                alert('Please select both required files.');
+                alert('Please select both required files (Polygon and ZIP Database).');
                 return;
             }
 
@@ -233,34 +239,67 @@
             // Clear previous data
             clearMap();
 
-            // Load the data
-            Promise.all([
-                loadZipDatabase(zipDbFile),
-                loadPolygonData(polygonFile)
-            ]).then(([zipDb, polygons]) => {
-                zipCoordinates = zipDb;
-                polygonData = polygons;
+            // Load the data with or without contained zips file
+            if (containedZipsFile) {
+                Promise.all([
+                    loadZipDatabase(zipDbFile),
+                    loadPolygonData(polygonFile),
+                    loadContainedZipsData(containedZipsFile)
+                ]).then(([zipDb, polygons, containedZips]) => {
+                    zipCoordinates = zipDb;
+                    polygonData = polygons;
+                    containedZipsData = containedZips;
 
-                // Process and display the polygons
-                processPolygons();
+                    // Process and display the polygons
+                    processPolygons();
 
-                // Hide loading indicator and file inputs
-                document.getElementById('loadingIndicator').style.display = 'none';
+                    // Hide loading indicator and file inputs
+                    document.getElementById('loadingIndicator').style.display = 'none';
 
-                // Show search container
-                document.getElementById('searchContainer').style.display = 'block';
+                    // Show search container
+                    document.getElementById('searchContainer').style.display = 'block';
 
-                // Show stats
-                updateStats();
-                document.getElementById('statsContainer').style.display = 'block';
+                    // Show stats
+                    updateStats();
+                    document.getElementById('statsContainer').style.display = 'block';
 
-                // Setup search functionality
-                setupSearch();
-            }).catch(error => {
-                console.error('Error loading data:', error);
-                alert('Error loading data: ' + error.message);
-                document.getElementById('loadingIndicator').style.display = 'none';
-            });
+                    // Setup search functionality
+                    setupSearch();
+                }).catch(error => {
+                    console.error('Error loading data:', error);
+                    alert('Error loading data: ' + error.message);
+                    document.getElementById('loadingIndicator').style.display = 'none';
+                });
+            } else {
+                Promise.all([
+                    loadZipDatabase(zipDbFile),
+                    loadPolygonData(polygonFile)
+                ]).then(([zipDb, polygons]) => {
+                    zipCoordinates = zipDb;
+                    polygonData = polygons;
+                    containedZipsData = {}; // Empty object if no file provided
+
+                    // Process and display the polygons
+                    processPolygons();
+
+                    // Hide loading indicator and file inputs
+                    document.getElementById('loadingIndicator').style.display = 'none';
+
+                    // Show search container
+                    document.getElementById('searchContainer').style.display = 'block';
+
+                    // Show stats
+                    updateStats();
+                    document.getElementById('statsContainer').style.display = 'block';
+
+                    // Setup search functionality
+                    setupSearch();
+                }).catch(error => {
+                    console.error('Error loading data:', error);
+                    alert('Error loading data: ' + error.message);
+                    document.getElementById('loadingIndicator').style.display = 'none';
+                });
+            }
         }
 
         // Function to clear the map
@@ -346,10 +385,10 @@
                         }
 
                         const validRows = results.data.filter(row => {
-                            // Check if the row has the necessary fields
+                            // Check if the row has the necessary fields for the new file structure
                             return row &&
                                    row.business_id !== undefined &&
-                                   row.business_location !== undefined &&
+                                   row.biz_zip !== undefined &&
                                    row.boundary_zips !== undefined;
                         });
 
@@ -364,6 +403,38 @@
                         reject(error);
                     }
                 });
+            });
+        }
+
+        // Load contained ZIPs data from JSON file
+        function loadContainedZipsData(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+
+                reader.onload = function(event) {
+                    try {
+                        const jsonData = JSON.parse(event.target.result);
+
+                        // Convert array to object with business_id as key
+                        const containedZipsMap = {};
+                        jsonData.forEach(item => {
+                            if (item.business_id && item.contained_zips) {
+                                containedZipsMap[item.business_id] = item.contained_zips;
+                            }
+                        });
+
+                        console.log(`Loaded contained ZIPs data for ${Object.keys(containedZipsMap).length} businesses`);
+                        resolve(containedZipsMap);
+                    } catch (error) {
+                        reject(new Error('Error parsing contained ZIPs JSON: ' + error.message));
+                    }
+                };
+
+                reader.onerror = function() {
+                    reject(new Error('Failed to read contained ZIPs file'));
+                };
+
+                reader.readAsText(file);
             });
         }
 
@@ -393,7 +464,7 @@
                 boundaryZips = boundaryZips.filter(zip => !isNaN(zip));
 
                 if (boundaryZips.length < 3) {
-                    console.warn(`Skipping ${row.business_location}: Not enough valid boundary ZIPs`);
+                    console.warn(`Skipping ${row.biz_zip}: Not enough valid boundary ZIPs`);
                     return;
                 }
 
@@ -407,7 +478,7 @@
 
                 // Skip if not enough points for a polygon (need at least 3)
                 if (polygonCoords.length < 3) {
-                    console.warn(`Skipping ${row.business_location}: Not enough valid coordinates for boundary ZIPs`);
+                    console.warn(`Skipping ${row.biz_zip}: Not enough valid coordinates for boundary ZIPs`);
                     return;
                 }
 
@@ -439,11 +510,13 @@
                 // Create the polygon popup
                 const popupContent = `
                     <div class="info-card">
-                        <h2>${row.business_location} ZIP Code Analysis</h2>
+                        <h2>Business ZIP ${row.biz_zip} Analysis</h2>
+                        <p><strong>Business ID:</strong> ${row.business_id}</p>
                         <p><strong>Boundary ZIPs:</strong> ${boundaryZips.join(', ')}</p>
                         <p><strong>Contained:</strong> ${containedCount} ZIPs</p>
                         <p><strong>Total within 100mi:</strong> ${within100mi} ZIPs</p>
                         <p><strong>Coverage:</strong> ${coverage}%</p>
+                        <p><strong>Max Distance:</strong> ${row.max_polygon_distance || 'N/A'} miles</p>
                     </div>
                 `;
 
@@ -455,7 +528,7 @@
                 // Add to processed polygons array
                 processedPolygons.push({
                     id: row.business_id,
-                    location: row.business_location,
+                    zipCode: row.biz_zip,
                     boundaryZips: boundaryZips,
                     containedCount: containedCount,
                     within100mi: within100mi,
@@ -493,10 +566,13 @@
                     markers.centers.push(centerMarker);
                 }
 
-                // Get contained ZIP codes (if available as JSON)
-                // This would require additional data or calculation
-                // For visualization purposes, we can simulate some contained ZIPs
-                simulateContainedZips(polygon, containedCount);
+                // Add markers for contained ZIPs (if available in the JSON data)
+                if (containedZipsData[row.business_id]) {
+                    addContainedZipMarkers(polygon, containedZipsData[row.business_id]);
+                } else {
+                    // Fall back to simulation if no actual data available
+                    simulateContainedZips(polygon, containedCount);
+                }
             });
 
             // Set view to show all polygons
@@ -510,7 +586,36 @@
             }
         }
 
-        // Function to simulate contained ZIPs for visualization
+        // Function to add markers for actual contained ZIPs
+        function addContainedZipMarkers(polygon, containedZips) {
+            // Limit the number of markers for performance
+            const maxMarkers = Math.min(containedZips.length, 30);
+
+            if (maxMarkers <= 0) return;
+
+            // Shuffle the array and take the first maxMarkers items for a random sample
+            const shuffledZips = [...containedZips].sort(() => 0.5 - Math.random()).slice(0, maxMarkers);
+
+            // Create markers for contained ZIPs
+            for (const zip of shuffledZips) {
+                if (zip in zipCoordinates) {
+                    const coord = zipCoordinates[zip];
+
+                    const marker = L.circleMarker(coord, {
+                        radius: 3,
+                        fillColor: '#33cc33',
+                        color: '#009900',
+                        weight: 1,
+                        opacity: 1,
+                        fillOpacity: 0.8
+                    }).bindTooltip(`ZIP: ${zip}`).addTo(map);
+
+                    markers.contained.push(marker);
+                }
+            }
+        }
+
+        // Function to simulate contained ZIPs for visualization (fallback)
         function simulateContainedZips(polygon, count) {
             // Limit the number of markers for performance
             const maxMarkers = Math.min(count, 30);
@@ -610,8 +715,12 @@
                     return;
                 }
 
+                // Search by both business ID and ZIP code
                 const matchingLocations = processedPolygons
-                    .filter(p => p.location.toLowerCase().includes(searchTerm))
+                    .filter(p =>
+                        p.id.toLowerCase().includes(searchTerm) ||
+                        p.zipCode.toString().includes(searchTerm)
+                    )
                     .slice(0, 10); // Limit to 10 results
 
                 resultsContainer.innerHTML = '';
@@ -624,7 +733,7 @@
                 matchingLocations.forEach(location => {
                     const div = document.createElement('div');
                     div.className = 'search-result';
-                    div.textContent = location.location;
+                    div.textContent = `Business ID: ${location.id} - ZIP: ${location.zipCode}`;
                     div.addEventListener('click', function() {
                         // Zoom to the polygon
                         const polygon = location.polygonLayer;
