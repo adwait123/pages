@@ -371,38 +371,82 @@
         // Load polygon data
         function loadPolygonData(file) {
             return new Promise((resolve, reject) => {
-                // Determine delimiter based on file extension
-                const delimiter = file.name.toLowerCase().endsWith('.tsv') ? '\t' : ',';
+                // First read the file to inspect content
+                const reader = new FileReader();
 
-                Papa.parse(file, {
-                    header: true,
-                    delimiter: delimiter,
-                    dynamicTyping: true,
-                    skipEmptyLines: true,
-                    complete: function(results) {
-                        if (results.errors && results.errors.length > 0) {
-                            console.warn('Warnings parsing polygon data:', results.errors);
+                reader.onload = function(e) {
+                    const fileContent = e.target.result;
+                    console.log('File content preview:', fileContent.substring(0, 200));
+
+                    // Determine delimiter based on file extension and content
+                    const delimiter = file.name.toLowerCase().endsWith('.tsv') ? '\t' : ',';
+
+                    // Parse with PapaParse
+                    Papa.parse(fileContent, {
+                        header: true,
+                        delimiter: delimiter,
+                        dynamicTyping: true,
+                        skipEmptyLines: true,
+                        complete: function(results) {
+                            if (results.errors && results.errors.length > 0) {
+                                console.warn('Warnings parsing polygon data:', results.errors);
+                            }
+
+                            // Check if we have data
+                            if (!results.data || results.data.length === 0) {
+                                reject(new Error('No data parsed from file. Check file format.'));
+                                return;
+                            }
+
+                            // Log column headers to help debug
+                            console.log('Column headers:', results.meta.fields);
+                            console.log('Sample row:', results.data[0]);
+
+                            // More flexible field validation
+                            const validRows = results.data.filter(row => {
+                                // Check for business_id
+                                const hasBusinessId = row.business_id !== undefined;
+
+                                // Check for either biz_zip or business_location
+                                const hasLocation = row.biz_zip !== undefined || row.business_location !== undefined;
+
+                                // Check for boundary_zips
+                                const hasBoundaryZips = row.boundary_zips !== undefined;
+
+                                return row && hasBusinessId && hasLocation && hasBoundaryZips;
+                            });
+
+                            if (validRows.length === 0) {
+                                reject(new Error('No valid polygon data found. Check file format (needs business_id, biz_zip/business_location, and boundary_zips fields).'));
+                            } else {
+                                // Normalize the data to ensure consistency
+                                const normalizedRows = validRows.map(row => {
+                                    // Create a copy to avoid modifying the original
+                                    const normalizedRow = {...row};
+
+                                    // Ensure biz_zip exists - use business_location as fallback
+                                    if (normalizedRow.biz_zip === undefined && normalizedRow.business_location !== undefined) {
+                                        normalizedRow.biz_zip = normalizedRow.business_location;
+                                    }
+
+                                    return normalizedRow;
+                                });
+
+                                console.log(`Loaded ${normalizedRows.length} business locations with valid data`);
+                                resolve(normalizedRows);
+                            }
+                        },
+                        error: function(error) {
+                            reject(error);
                         }
+                    });
+                };
 
-                        const validRows = results.data.filter(row => {
-                            // Check if the row has the necessary fields for the new file structure
-                            return row &&
-                                   row.business_id !== undefined &&
-                                   row.biz_zip !== undefined &&
-                                   row.boundary_zips !== undefined;
-                        });
+                reader.onerror = function() {
+                    reject(new Error('Failed to read file.'));
+                };
 
-                        if (validRows.length === 0) {
-                            reject(new Error('No valid polygon data found. Check file format.'));
-                        } else {
-                            console.log(`Loaded ${validRows.length} business locations`);
-                            resolve(validRows);
-                        }
-                    },
-                    error: function(error) {
-                        reject(error);
-                    }
-                });
+                reader.readAsText(file);
             });
         }
 
@@ -469,17 +513,27 @@
                 }
 
                 // Get coordinates for boundary ZIPs
-                const polygonCoords = [];
+                const originalCoords = [];
                 for (const zip of boundaryZips) {
                     if (zip in zipCoordinates) {
-                        polygonCoords.push(zipCoordinates[zip]);
+                        originalCoords.push(zipCoordinates[zip]);
                     }
                 }
 
                 // Skip if not enough points for a polygon (need at least 3)
-                if (polygonCoords.length < 3) {
+                if (originalCoords.length < 3) {
                     console.warn(`Skipping ${row.biz_zip}: Not enough valid coordinates for boundary ZIPs`);
                     return;
+                }
+
+                // Create convex hull from coordinates
+                const polygonCoords = convexHull(originalCoords);
+
+                // Fallback to rectangular hull if convex hull fails
+                if (polygonCoords.length < 3) {
+                    console.warn(`Convex hull calculation failed for ${row.biz_zip}, using rectangular hull instead`);
+                    const rectHull = createRectangularHull(originalCoords);
+                    polygonCoords.push(...rectHull);
                 }
 
                 // Calculate center point
@@ -538,8 +592,8 @@
                     polygonLayer: polygon
                 });
 
-                // Add markers for polygon vertices (red)
-                polygonCoords.forEach(coord => {
+                // Add markers for original boundary points (red)
+                originalCoords.forEach(coord => {
                     const marker = L.circleMarker(coord, {
                         radius: 4,
                         fillColor: '#ff3333',
@@ -584,6 +638,90 @@
                 // Add legend
                 legend.addTo(map);
             }
+        }
+
+        // Monotone chain algorithm for computing convex hull
+        // This is a more reliable implementation than Graham scan
+        function convexHull(points) {
+            // Return if we don't have enough points
+            if (points.length < 3) return points;
+
+            // Sort points lexicographically
+            points.sort((a, b) => {
+                return a[0] === b[0] ? a[1] - b[1] : a[0] - b[0];
+            });
+
+            const lowerHull = [];
+            const upperHull = [];
+
+            // Build lower hull
+            for (let i = 0; i < points.length; i++) {
+                while (
+                    lowerHull.length >= 2 &&
+                    !isClockwiseTurn(
+                        lowerHull[lowerHull.length - 2],
+                        lowerHull[lowerHull.length - 1],
+                        points[i]
+                    )
+                ) {
+                    lowerHull.pop();
+                }
+                lowerHull.push(points[i]);
+            }
+
+            // Build upper hull
+            for (let i = points.length - 1; i >= 0; i--) {
+                while (
+                    upperHull.length >= 2 &&
+                    !isClockwiseTurn(
+                        upperHull[upperHull.length - 2],
+                        upperHull[upperHull.length - 1],
+                        points[i]
+                    )
+                ) {
+                    upperHull.pop();
+                }
+                upperHull.push(points[i]);
+            }
+
+            // Remove duplicate points (first and last points of each hull)
+            lowerHull.pop();
+            upperHull.pop();
+
+            // Combine hulls to get the convex hull
+            const convexHullPoints = [...lowerHull, ...upperHull];
+
+            return convexHullPoints.length >= 3 ? convexHullPoints : createRectangularHull(points);
+        }
+
+        // Helper function to check if three points make a clockwise turn
+        function isClockwiseTurn(p1, p2, p3) {
+            const crossProduct = (p2[1] - p1[1]) * (p3[0] - p2[0]) - (p2[0] - p1[0]) * (p3[1] - p2[1]);
+            return crossProduct < 0;
+        }
+
+        // Function to create a rectangular hull (bounding box) from points
+        function createRectangularHull(points) {
+            // Find min/max latitude and longitude
+            let minLat = Infinity;
+            let maxLat = -Infinity;
+            let minLng = Infinity;
+            let maxLng = -Infinity;
+
+            points.forEach(point => {
+                minLat = Math.min(minLat, point[0]);
+                maxLat = Math.max(maxLat, point[0]);
+                minLng = Math.min(minLng, point[1]);
+                maxLng = Math.max(maxLng, point[1]);
+            });
+
+            // Create a rectangular hull (ordered for proper polygon drawing)
+            return [
+                [minLat, minLng], // bottom-left
+                [minLat, maxLng], // bottom-right
+                [maxLat, maxLng], // top-right
+                [maxLat, minLng]  // top-left
+            ];
         }
 
         // Function to add markers for actual contained ZIPs
